@@ -151,7 +151,9 @@ async def get_target_artists() -> List[str]:
 
 # ── Artsy — concurrent GraphQL ────────────────────────────────────────────────
 ARTSY_GQL   = "https://metaphysics.artsy.net/v2"
-ARTSY_QUERY = """
+
+# Query 1: for-sale artworks only
+ARTSY_QUERY_FORSALE = """
 query($slug: String!) {
   artist(id: $slug) {
     filterArtworksConnection(forSale: true, first: 30) {
@@ -171,29 +173,67 @@ query($slug: String!) {
 }
 """
 
+# Query 2: all artworks (fallback — we filter by availability in saleMessage)
+ARTSY_QUERY_ALL = """
+query($slug: String!) {
+  artist(id: $slug) {
+    artworksConnection(first: 30, sort: "-partner_updated_at") {
+      edges {
+        node {
+          internalID title date medium isForSale
+          dimensions { in cm }
+          saleMessage
+          partner { name }
+          image { url(version: "large") }
+          href
+          sale { isAuction }
+        }
+      }
+    }
+  }
+}
+"""
+
+def _parse_artsy_edges(edges, name) -> List[dict]:
+    results = []
+    for edge in edges:
+        n      = edge.get("node", {})
+        med    = n.get("medium") or ""
+        if not valid_medium(med):
+            continue
+        # Skip if explicitly not for sale
+        sale_msg = n.get("saleMessage") or ""
+        if sale_msg.lower() in ("not for sale", "sold"):
+            continue
+        seller = ((n.get("partner") or {}).get("name") or "")
+        is_auc = bool(((n.get("sale") or {}).get("isAuction"))) or is_auction_house(seller)
+        dims   = n.get("dimensions") or {}
+        results.append(make_row(
+            name, n.get("title"), n.get("date"), med,
+            dims.get("in") or dims.get("cm"),
+            sale_msg, seller,
+            "https://artsy.net" + (n.get("href") or ""),
+            "Artsy", (n.get("image") or {}).get("url"), is_auc,
+        ))
+    return results
+
 async def _artsy_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: str) -> List[dict]:
     async with sem:
         try:
-            resp        = await client.post(ARTSY_GQL, json={"query": ARTSY_QUERY, "variables": {"slug": slug(name)}}, headers={"Content-Type": "application/json"})
-            artist_data = (resp.json().get("data") or {}).get("artist") or {}
+            # Try forSale query first
+            resp        = await client.post(ARTSY_GQL, json={"query": ARTSY_QUERY_FORSALE, "variables": {"slug": slug(name)}}, headers={"Content-Type": "application/json"})
+            data        = resp.json()
+            artist_data = (data.get("data") or {}).get("artist") or {}
             edges       = (artist_data.get("filterArtworksConnection") or {}).get("edges", [])
-            results     = []
-            for edge in edges:
-                n      = edge.get("node", {})
-                med    = n.get("medium") or ""
-                if not valid_medium(med):
-                    continue
-                seller = ((n.get("partner") or {}).get("name") or "")
-                is_auc = bool(((n.get("sale") or {}).get("isAuction"))) or is_auction_house(seller)
-                dims   = n.get("dimensions") or {}
-                results.append(make_row(
-                    name, n.get("title"), n.get("date"), med,
-                    dims.get("in") or dims.get("cm"),
-                    n.get("saleMessage"), seller,
-                    "https://artsy.net" + (n.get("href") or ""),
-                    "Artsy", (n.get("image") or {}).get("url"), is_auc,
-                ))
-            return results
+
+            # If forSale returned nothing, fall back to all artworks query
+            if not edges:
+                resp2       = await client.post(ARTSY_GQL, json={"query": ARTSY_QUERY_ALL, "variables": {"slug": slug(name)}}, headers={"Content-Type": "application/json"})
+                data2       = resp2.json()
+                artist_data2 = (data2.get("data") or {}).get("artist") or {}
+                edges       = (artist_data2.get("artworksConnection") or {}).get("edges", [])
+
+            return _parse_artsy_edges(edges, name)
         except Exception as e:
             print(f"Artsy [{name}]: {e}")
             return []
