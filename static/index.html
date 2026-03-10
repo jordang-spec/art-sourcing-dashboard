@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Art Sourcing — Masterworks</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-stone-50 min-h-screen">
+
+<!-- Header -->
+<div class="bg-white border-b border-stone-200 sticky top-0 z-10">
+  <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+    <div>
+      <h1 class="text-sm font-bold tracking-[0.15em] text-stone-900 uppercase">Art Sourcing Dashboard</h1>
+      <p class="text-xs text-stone-400 mt-0.5">Masterworks · Acquisition Pipeline</p>
+    </div>
+    <div class="flex items-center gap-3">
+      <span id="status-msg" class="text-xs text-stone-400 max-w-xs text-right"></span>
+      <button id="refresh-btn" onclick="triggerScrape()"
+        class="inline-flex items-center gap-2 bg-stone-900 text-white text-sm px-4 py-2 rounded-lg hover:bg-stone-700 transition disabled:opacity-40">
+        <svg id="spin-icon" class="w-3.5 h-3.5 hidden animate-spin" fill="none" viewBox="0 0 24 24">
+          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"/>
+        </svg>
+        <svg id="refresh-icon" class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+        </svg>
+        <span id="btn-label">Refresh Data</span>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Filters -->
+<div class="bg-white border-b border-stone-100">
+  <div class="max-w-7xl mx-auto px-6 py-3 flex flex-wrap items-center gap-3">
+    <div class="relative">
+      <svg class="absolute left-3 top-2.5 w-3.5 h-3.5 text-stone-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+      </svg>
+      <input id="search" type="text" placeholder="Search artist or title…"
+        class="pl-9 pr-4 py-2 text-sm border border-stone-200 rounded-lg w-72 focus:outline-none focus:ring-2 focus:ring-stone-900"
+        oninput="applyFilters()"/>
+    </div>
+
+    <div class="flex bg-stone-100 rounded-lg p-0.5 text-sm gap-0.5">
+      <button class="tab px-3 py-1.5 rounded-md bg-white shadow-sm font-medium text-stone-900" data-t="All" onclick="setType('All',this)">All</button>
+      <button class="tab px-3 py-1.5 rounded-md font-medium text-stone-500" data-t="Auction" onclick="setType('Auction',this)">Auction</button>
+      <button class="tab px-3 py-1.5 rounded-md font-medium text-stone-500" data-t="Private" onclick="setType('Private',this)">Private Sale</button>
+    </div>
+
+    <select id="src" onchange="applyFilters()"
+      class="text-sm border border-stone-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-stone-900">
+      <option value="">All Sources</option>
+      <option>Artsy</option>
+      <option>Artnet</option>
+      <option>Seesaw</option>
+      <option>Christie's</option>
+      <option>Sotheby's</option>
+      <option>Phillips</option>
+    </select>
+
+    <span id="count" class="ml-auto text-xs text-stone-400"></span>
+  </div>
+</div>
+
+<!-- Body -->
+<div class="max-w-7xl mx-auto px-6 py-8">
+
+  <!-- Progress -->
+  <div id="progress" class="hidden mb-6 bg-white border border-stone-200 rounded-xl p-4 flex items-center gap-3">
+    <svg class="w-4 h-4 animate-spin text-stone-500 shrink-0" fill="none" viewBox="0 0 24 24">
+      <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+      <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"/>
+    </svg>
+    <p id="progress-text" class="text-sm text-stone-600">Starting…</p>
+  </div>
+
+  <!-- Empty -->
+  <div id="empty" class="text-center py-24 text-stone-400">
+    <svg class="w-14 h-14 mx-auto mb-4 text-stone-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1"
+        d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+    </svg>
+    <p class="font-medium text-stone-500">No artworks yet</p>
+    <p class="text-sm mt-1">Click <strong>Refresh Data</strong> to begin sourcing</p>
+  </div>
+
+  <!-- Grid -->
+  <div id="grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5 gap-4"></div>
+</div>
+
+<script>
+let all = [], currentType = 'All', pollTimer = null;
+
+async function load() {
+  const res = await fetch('/api/artworks');
+  all = await res.json();
+  applyFilters();
+}
+
+function applyFilters() {
+  const q   = document.getElementById('search').value.toLowerCase();
+  const src = document.getElementById('src').value;
+  const f   = all.filter(a =>
+    (!q  || (a.artist_name||'').toLowerCase().includes(q) || (a.title||'').toLowerCase().includes(q)) &&
+    (currentType === 'All' || a.sale_type === currentType) &&
+    (!src || a.source_name === src)
+  );
+  render(f);
+}
+
+function setType(t, btn) {
+  currentType = t;
+  document.querySelectorAll('.tab').forEach(b => {
+    b.classList.remove('bg-white','shadow-sm','text-stone-900');
+    b.classList.add('text-stone-500');
+  });
+  btn.classList.add('bg-white','shadow-sm','text-stone-900');
+  btn.classList.remove('text-stone-500');
+  applyFilters();
+}
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function render(artworks) {
+  const grid  = document.getElementById('grid');
+  const empty = document.getElementById('empty');
+  document.getElementById('count').textContent = `${artworks.length} work${artworks.length!==1?'s':''}`;
+  if (!artworks.length) { grid.innerHTML=''; empty.classList.remove('hidden'); return; }
+  empty.classList.add('hidden');
+  grid.innerHTML = artworks.map(a => `
+    <a href="${esc(a.source_url||'#')}" target="_blank" rel="noopener"
+       class="group bg-white rounded-xl overflow-hidden border border-stone-100 hover:shadow-lg transition-shadow flex flex-col">
+      <div class="aspect-[4/5] bg-stone-100 relative overflow-hidden">
+        ${a.image_url ? `<img src="${esc(a.image_url)}" alt="${esc(a.title)}"
+               class="w-full h-full object-contain group-hover:scale-[1.03] transition-transform duration-300"
+               onerror="this.style.display='none'">` : ''}
+        <div class="absolute top-2 left-2 flex gap-1">
+          <span class="${a.is_auction?'bg-orange-500':'bg-blue-600'} text-white text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wide">
+            ${esc(a.sale_type||'Private')}
+          </span>
+          <span class="bg-black/60 text-white text-[10px] px-2 py-0.5 rounded-full">
+            ${esc(a.source_name||'')}
+          </span>
+        </div>
+      </div>
+      <div class="p-3 flex flex-col gap-0.5 flex-1">
+        <p class="text-[10px] font-bold text-stone-400 uppercase tracking-widest truncate">${esc(a.artist_name)}</p>
+        <p class="text-sm font-medium text-stone-900 leading-snug line-clamp-2">
+          ${esc(a.title||'Untitled')}${a.year?` <span class="font-normal text-stone-500">, ${esc(a.year)}</span>`:''}
+        </p>
+        ${a.medium    ? `<p class="text-[11px] text-stone-400 truncate">${esc(a.medium)}</p>`    : ''}
+        ${a.dimensions? `<p class="text-[11px] text-stone-400">${esc(a.dimensions)}</p>`         : ''}
+        <div class="mt-auto pt-2 flex items-end justify-between gap-2">
+          <p class="text-sm font-semibold text-stone-900">
+            ${a.price ? esc(a.price) : '<span class="text-stone-400 font-normal text-xs">Price on request</span>'}
+          </p>
+          ${a.seller_name ? `<p class="text-[10px] text-stone-400 truncate text-right max-w-[90px]">${esc(a.seller_name)}</p>` : ''}
+        </div>
+      </div>
+    </a>`).join('');
+}
+
+async function triggerScrape() {
+  const btn = document.getElementById('refresh-btn');
+  btn.disabled = true;
+  document.getElementById('spin-icon').classList.remove('hidden');
+  document.getElementById('refresh-icon').classList.add('hidden');
+  document.getElementById('btn-label').textContent = 'Scraping…';
+  document.getElementById('progress').classList.remove('hidden');
+  await fetch('/api/scrape', {method:'POST'});
+  pollTimer = setInterval(poll, 2500);
+}
+
+async function poll() {
+  try {
+    const data = await (await fetch('/api/scrape/status')).json();
+    document.getElementById('progress-text').textContent = data.message || 'Running…';
+    document.getElementById('status-msg').textContent    = data.message || '';
+    if (['done','idle','error'].includes(data.status)) {
+      clearInterval(pollTimer);
+      resetBtn();
+      document.getElementById('progress').classList.add('hidden');
+      if (data.last_run) {
+        document.getElementById('status-msg').textContent =
+          `${data.message||''} · ${new Date(data.last_run).toLocaleTimeString()}`;
+      }
+      if (data.status === 'done') load();
+    }
+  } catch(e) { clearInterval(pollTimer); resetBtn(); }
+}
+
+function resetBtn() {
+  document.getElementById('refresh-btn').disabled = false;
+  document.getElementById('spin-icon').classList.add('hidden');
+  document.getElementById('refresh-icon').classList.remove('hidden');
+  document.getElementById('btn-label').textContent = 'Refresh Data';
+}
+
+load();
+</script>
+</body>
+</html>
