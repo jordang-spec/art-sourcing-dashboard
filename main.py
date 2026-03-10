@@ -1,4 +1,4 @@
-import os, uuid, re, asyncio, json
+import os, uuid, re, asyncio, json, urllib.parse
 from datetime import datetime
 from typing import Optional, List
 
@@ -55,6 +55,7 @@ Base.metadata.create_all(bind=engine)
 AIRTABLE_TOKEN    = os.getenv("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE_ID  = "app8GJgnPtP23cObV"
 AIRTABLE_TABLE_ID = "tblClPSzECL3rpbd0"
+SCRAPERAPI_KEY    = os.getenv("SCRAPERAPI_KEY", "")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -119,6 +120,12 @@ def make_row(artist, title, year, medium, dims, price, seller, src_url, src_name
         "source_id":   f"{src_name}_{artist}_{(title or '')[:40]}".replace(" ", "_"),
     }
 
+def _purl(url: str) -> str:
+    """Route through ScraperAPI when a key is configured (bypasses bot detection)."""
+    if not SCRAPERAPI_KEY:
+        return url
+    return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={urllib.parse.quote(url)}"
+
 # ── Airtable ──────────────────────────────────────────────────────────────────
 async def get_target_artists() -> List[str]:
     if not AIRTABLE_TOKEN:
@@ -149,7 +156,7 @@ async def get_target_artists() -> List[str]:
         print(f"Airtable error: {e}")
         return FALLBACK_ARTISTS
 
-# ── Artsy — web scraper (no API key needed) ────────────────────────────────────
+# ── Artsy — web scraper via __NEXT_DATA__ ─────────────────────────────────────
 def _artsy_find_artworks(obj, depth=0) -> List[dict]:
     """Recursively find Artwork relay nodes in Artsy's __NEXT_DATA__."""
     if depth > 25 or not obj:
@@ -198,20 +205,17 @@ async def _artsy_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: st
     async with sem:
         try:
             url  = f"https://www.artsy.net/artist/{slug(name)}/works-for-sale"
-            resp = await client.get(url, headers=HEADERS, follow_redirects=True)
+            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
             if resp.status_code != 200:
                 print(f"Artsy [{name}]: HTTP {resp.status_code}")
                 return []
-
             soup   = BeautifulSoup(resp.text, "html.parser")
             nd_tag = soup.find("script", {"id": "__NEXT_DATA__"})
             if not nd_tag or not nd_tag.string:
-                print(f"Artsy [{name}]: no __NEXT_DATA__")
+                print(f"Artsy [{name}]: no __NEXT_DATA__ found")
                 return []
-
             nd_data  = json.loads(nd_tag.string)
             aw_nodes = _artsy_find_artworks(nd_data)
-
             seen, results = set(), []
             for aw in aw_nodes:
                 key = aw.get("internalID") or aw.get("slug") or aw.get("title")
@@ -247,7 +251,7 @@ async def _artsy_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: st
 
 async def scrape_artsy(artists: List[str]) -> List[dict]:
     sem = asyncio.Semaphore(5)
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         batches = await asyncio.gather(*[_artsy_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
@@ -256,7 +260,7 @@ async def _artnet_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: s
     async with sem:
         try:
             url  = f"https://www.artnet.com/artists/{slug(name)}/works-for-sale/"
-            resp = await client.get(url, headers=HEADERS, follow_redirects=True)
+            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
             soup = BeautifulSoup(resp.text, "html.parser")
             results = []
             for card in soup.select("[class*='artwork-card'], [class*='GridItem'], [class*='ArtworkCard']")[:15]:
@@ -279,20 +283,19 @@ async def _artnet_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: s
 
 async def scrape_artnet(artists: List[str]) -> List[dict]:
     sem = asyncio.Semaphore(5)
-    async with httpx.AsyncClient(timeout=12) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         batches = await asyncio.gather(*[_artnet_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
 # ── Sotheby's ─────────────────────────────────────────────────────────────────
 def _sothebys_find_lots(obj, depth=0) -> List[dict]:
-    """Scan __NEXT_DATA__ for arrays that look like lot listings."""
     if depth > 15 or not obj:
         return []
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k in ("lots", "items", "results", "data", "nodes", "edges") and isinstance(v, list) and v:
-                first = v[0] if isinstance(v[0], dict) else (v[0].get("node") if isinstance(v[0], dict) else None)
-                if first and any(x in first for x in ("lotNumber", "lotId", "title", "estimate", "lotTitle")):
+                first = v[0] if isinstance(v[0], dict) else {}
+                if any(x in first for x in ("lotNumber", "lotId", "title", "estimate", "lotTitle")):
                     return v
             sub = _sothebys_find_lots(v, depth + 1)
             if sub:
@@ -307,36 +310,33 @@ def _sothebys_find_lots(obj, depth=0) -> List[dict]:
 async def _sothebys_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: str) -> List[dict]:
     async with sem:
         try:
-            url    = "https://www.sothebys.com/en/buy/auction/search"
-            params = {"query": name, "locale": "en"}
-            resp   = await client.get(url, params=params, headers=HEADERS, follow_redirects=True)
-            soup   = BeautifulSoup(resp.text, "html.parser")
+            url  = f"https://www.sothebys.com/en/buy/auction/search?query={urllib.parse.quote(name)}&locale=en"
+            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            soup = BeautifulSoup(resp.text, "html.parser")
             results = []
 
-            # Try __NEXT_DATA__ first
             nd_tag = soup.find("script", {"id": "__NEXT_DATA__"})
             if nd_tag and nd_tag.string:
                 try:
                     nd   = json.loads(nd_tag.string)
                     lots = _sothebys_find_lots(nd)
                     for lot in lots[:10]:
-                        # Unwrap Relay edge/node if present
                         if "node" in lot and isinstance(lot["node"], dict):
                             lot = lot["node"]
                         title    = lot.get("title") or lot.get("lotTitle") or lot.get("description") or "Untitled"
                         estimate = lot.get("estimate") or lot.get("estimateDisplay") or lot.get("estimatedValue") or ""
                         if isinstance(estimate, dict):
-                            lo, hi = estimate.get("from") or estimate.get("low") or "", estimate.get("to") or estimate.get("high") or ""
+                            lo = estimate.get("from") or estimate.get("low") or ""
+                            hi = estimate.get("to") or estimate.get("high") or ""
                             estimate = f"Est. {lo}–{hi}" if lo and hi else str(lo or hi or "")
-                        img_raw  = lot.get("image") or lot.get("thumbnail") or lot.get("imageUrl") or {}
-                        img_url  = (img_raw.get("url") or img_raw.get("src") or "") if isinstance(img_raw, dict) else (img_raw if isinstance(img_raw, str) else "")
+                        img_raw = lot.get("image") or lot.get("thumbnail") or lot.get("imageUrl") or {}
+                        img_url = (img_raw.get("url") or img_raw.get("src") or "") if isinstance(img_raw, dict) else (img_raw if isinstance(img_raw, str) else "")
                         lot_path = lot.get("url") or lot.get("path") or lot.get("lotUrl") or ""
                         lot_url  = lot_path if lot_path.startswith("http") else f"https://www.sothebys.com{lot_path}"
                         results.append(make_row(name, title, "", "", "", estimate, "Sotheby's", lot_url, "Sotheby's", img_url, True))
                 except Exception as e:
-                    print(f"Sotheby's [{name}] __NEXT_DATA__ parse: {e}")
+                    print(f"Sotheby's [{name}] __NEXT_DATA__: {e}")
 
-            # HTML card fallback
             if not results:
                 for card in soup.select("[class*='LotCard'], [class*='lotCard'], [class*='lot-card'], article")[:10]:
                     title    = (card.select_one("h2, h3, [class*='title'], [class*='Title']") or {}).get_text(strip=True) or "Untitled"
@@ -357,43 +357,64 @@ async def _sothebys_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name:
 
 async def scrape_sothebys(artists: List[str]) -> List[dict]:
     sem = asyncio.Semaphore(4)
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         batches = await asyncio.gather(*[_sothebys_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
-# ── Christie's ────────────────────────────────────────────────────────────────
+# ── Christie's — HTML scrape ──────────────────────────────────────────────────
 async def _christies_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: str) -> List[dict]:
     async with sem:
         try:
-            url = "https://www.christies.com/api/discoverywebsite/auctioneventandlot/lotfinderputs"
-            # Try POST (the endpoint name suggests it accepts a body)
-            lots = []
-            try:
-                resp = await client.post(
-                    url,
-                    json={"keyword": name, "num_per_page": 10, "start_num": 0, "filters": {}},
-                    headers={**HEADERS, "Content-Type": "application/json", "Accept": "application/json"},
-                )
-                data = resp.json()
-                lots = data.get("lots") or []
-            except Exception:
-                # Fall back to GET
-                resp = await client.get(
-                    url,
-                    params={"keyword": name, "language": "en", "sortby": "relevance", "upcoming": "true", "pagesize": 10},
-                    headers={**HEADERS, "Accept": "application/json"},
-                )
-                data = resp.json()
-                lots = data.get("lots") or []
-
+            url  = f"https://www.christies.com/search/?q={urllib.parse.quote(name)}&section=lot&tab=lot"
+            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            soup = BeautifulSoup(resp.text, "html.parser")
             results = []
-            for lot in lots[:10]:
-                title   = lot.get("object_name") or lot.get("title_primary_txt") or lot.get("title") or "Untitled"
-                price   = lot.get("estimate_txt") or lot.get("price_realised_txt") or lot.get("estimate") or ""
-                img_url = (lot.get("image") or {}).get("image_url") or lot.get("imageUrl") or ""
-                lot_id  = lot.get("lotid") or lot.get("id") or ""
-                lot_url = f"https://www.christies.com/lot/lot-{lot_id}" if lot_id else "https://www.christies.com"
-                results.append(make_row(name, title, "", "", "", price, "Christie's", lot_url, "Christie's", img_url, True))
+
+            # __NEXT_DATA__ attempt
+            nd_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+            if nd_tag and nd_tag.string:
+                try:
+                    nd = json.loads(nd_tag.string)
+                    lots = []
+                    def _find_lots(obj, depth=0):
+                        if depth > 15 or not obj:
+                            return
+                        if isinstance(obj, dict):
+                            for k, v in obj.items():
+                                if k in ("lots", "results", "items") and isinstance(v, list) and v:
+                                    if isinstance(v[0], dict) and any(x in v[0] for x in ("lotId", "lotNumber", "lotTitle", "title")):
+                                        lots.extend(v[:10])
+                                        return
+                                _find_lots(v, depth + 1)
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                _find_lots(item, depth + 1)
+                    _find_lots(nd)
+                    for lot in lots[:10]:
+                        title    = lot.get("title") or lot.get("lotTitle") or lot.get("description") or "Untitled"
+                        price    = lot.get("estimate") or lot.get("estimateDisplay") or ""
+                        img_raw  = lot.get("image") or lot.get("imageUrl") or lot.get("thumbnail") or {}
+                        img_url  = (img_raw.get("url") or img_raw.get("src") or "") if isinstance(img_raw, dict) else (img_raw if isinstance(img_raw, str) else "")
+                        lot_path = lot.get("url") or lot.get("lotUrl") or lot.get("path") or ""
+                        lot_url  = lot_path if lot_path.startswith("http") else f"https://www.christies.com{lot_path}"
+                        if title and title != "Untitled":
+                            results.append(make_row(name, title, "", "", "", price, "Christie's", lot_url, "Christie's", img_url, True))
+                except Exception as e:
+                    print(f"Christie's [{name}] __NEXT_DATA__: {e}")
+
+            # HTML card fallback
+            if not results:
+                for card in soup.select("[class*='chr-list-item'], [class*='listItem'], [class*='lot-item'], article[data-id]")[:10]:
+                    title    = (card.select_one("[class*='heading'], [class*='title'], [class*='object-name'], h3, h2") or {}).get_text(strip=True) or "Untitled"
+                    estimate = (card.select_one("[class*='estimate'], [class*='price']") or {}).get_text(strip=True)
+                    img      = card.select_one("img")
+                    img_url  = (img.get("src") or img.get("data-src") or "") if img else ""
+                    a_tag    = card.select_one("a")
+                    href     = (a_tag.get("href") or "") if a_tag else ""
+                    lot_url  = href if href.startswith("http") else f"https://www.christies.com{href}"
+                    if title and title != "Untitled":
+                        results.append(make_row(name, title, "", "", "", estimate, "Christie's", lot_url, "Christie's", img_url, True))
+
             print(f"Christie's [{name}]: {len(results)} works")
             return results
         except Exception as e:
@@ -402,28 +423,62 @@ async def _christies_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name
 
 async def scrape_christies(artists: List[str]) -> List[dict]:
     sem = asyncio.Semaphore(5)
-    async with httpx.AsyncClient(timeout=12) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         batches = await asyncio.gather(*[_christies_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
-# ── Phillips ──────────────────────────────────────────────────────────────────
+# ── Phillips — HTML scrape ────────────────────────────────────────────────────
 async def _phillips_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: str) -> List[dict]:
     async with sem:
         try:
-            url    = "https://www.phillips.com/api/search/lots"
-            params = {"q": name, "upcoming": "true", "pageSize": 10}
-            resp   = await client.get(url, params=params, headers={**HEADERS, "Accept": "application/json"})
-            data   = resp.json()
-            lots   = data.get("hits") or data.get("results") or data.get("lots") or []
+            url  = f"https://www.phillips.com/search/lots?q={urllib.parse.quote(name)}"
+            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            soup = BeautifulSoup(resp.text, "html.parser")
             results = []
-            for lot in lots[:10]:
-                title   = lot.get("title") or lot.get("lotTitle") or lot.get("description") or "Untitled"
-                price   = lot.get("estimateDisplay") or lot.get("estimate") or lot.get("price") or ""
-                img_url = lot.get("imageUrl") or lot.get("image") or lot.get("thumbnailUrl") or ""
-                lot_url = lot.get("url") or lot.get("lotUrl") or "https://www.phillips.com"
-                if not lot_url.startswith("http"):
-                    lot_url = f"https://www.phillips.com{lot_url}"
-                results.append(make_row(name, title, "", "", "", price, "Phillips", lot_url, "Phillips", img_url, True))
+
+            nd_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+            if nd_tag and nd_tag.string:
+                try:
+                    nd = json.loads(nd_tag.string)
+                    lots = []
+                    def _find_lots_p(obj, depth=0):
+                        if depth > 15 or not obj:
+                            return
+                        if isinstance(obj, dict):
+                            for k, v in obj.items():
+                                if k in ("lots", "results", "hits", "items") and isinstance(v, list) and v:
+                                    if isinstance(v[0], dict) and any(x in v[0] for x in ("lotNumber", "title", "estimate")):
+                                        lots.extend(v[:10])
+                                        return
+                                _find_lots_p(v, depth + 1)
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                _find_lots_p(item, depth + 1)
+                    _find_lots_p(nd)
+                    for lot in lots[:10]:
+                        title    = lot.get("title") or lot.get("lotTitle") or "Untitled"
+                        price    = lot.get("estimate") or lot.get("estimateDisplay") or ""
+                        img_raw  = lot.get("image") or lot.get("imageUrl") or {}
+                        img_url  = (img_raw.get("url") or img_raw.get("src") or "") if isinstance(img_raw, dict) else (img_raw if isinstance(img_raw, str) else "")
+                        lot_path = lot.get("url") or lot.get("lotUrl") or ""
+                        lot_url  = lot_path if lot_path.startswith("http") else f"https://www.phillips.com{lot_path}"
+                        if title and title != "Untitled":
+                            results.append(make_row(name, title, "", "", "", price, "Phillips", lot_url, "Phillips", img_url, True))
+                except Exception as e:
+                    print(f"Phillips [{name}] __NEXT_DATA__: {e}")
+
+            if not results:
+                for card in soup.select("[class*='LotTile'], [class*='lotTile'], [class*='lot-tile'], [class*='SearchResult'], article")[:10]:
+                    title    = (card.select_one("[class*='title'], [class*='Title'], h3, h2") or {}).get_text(strip=True) or "Untitled"
+                    estimate = (card.select_one("[class*='estimate'], [class*='price'], [class*='Estimate']") or {}).get_text(strip=True)
+                    img      = card.select_one("img")
+                    img_url  = (img.get("src") or img.get("data-src") or "") if img else ""
+                    a_tag    = card.select_one("a")
+                    href     = (a_tag.get("href") or "") if a_tag else ""
+                    lot_url  = href if href.startswith("http") else f"https://www.phillips.com{href}"
+                    if title and title != "Untitled":
+                        results.append(make_row(name, title, "", "", "", estimate, "Phillips", lot_url, "Phillips", img_url, True))
+
             print(f"Phillips [{name}]: {len(results)} works")
             return results
         except Exception as e:
@@ -432,7 +487,7 @@ async def _phillips_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name:
 
 async def scrape_phillips(artists: List[str]) -> List[dict]:
     sem = asyncio.Semaphore(5)
-    async with httpx.AsyncClient(timeout=12) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         batches = await asyncio.gather(*[_phillips_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
@@ -440,8 +495,8 @@ async def scrape_phillips(artists: List[str]) -> List[dict]:
 async def _seesaw_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: str) -> List[dict]:
     async with sem:
         try:
-            url  = f"https://www.seesaw.website/works?q={name.replace(' ', '+')}&for_sale=true"
-            resp = await client.get(url, headers=HEADERS, follow_redirects=True)
+            url  = f"https://www.seesaw.website/works?q={urllib.parse.quote(name)}&for_sale=true"
+            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
             soup = BeautifulSoup(resp.text, "html.parser")
             results = []
             for card in soup.select("[class*='WorkCard'], article, [class*='work-card']")[:15]:
@@ -464,7 +519,7 @@ async def _seesaw_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: s
 
 async def scrape_seesaw(artists: List[str]) -> List[dict]:
     sem = asyncio.Semaphore(5)
-    async with httpx.AsyncClient(timeout=12) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         batches = await asyncio.gather(*[_seesaw_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
@@ -487,7 +542,8 @@ async def run_scrape():
         try:
             _set_status(db, "running", "Fetching artists from Airtable…")
             artists = await get_target_artists()
-            _set_status(db, "running", f"Scraping {len(artists)} artists across Artsy, Artnet, Sotheby's, Christie's, Phillips, Seesaw…")
+            proxy_note = " via ScraperAPI" if SCRAPERAPI_KEY else " (no SCRAPERAPI_KEY — results may be limited)"
+            _set_status(db, "running", f"Scraping {len(artists)} artists across 6 sources{proxy_note}…")
 
             artsy_r, artnet_r, sothebys_r, christies_r, phillips_r, seesaw_r = await asyncio.gather(
                 scrape_artsy(artists),
