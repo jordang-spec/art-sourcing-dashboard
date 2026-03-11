@@ -57,6 +57,10 @@ AIRTABLE_BASE_ID  = "app8GJgnPtP23cObV"
 AIRTABLE_TABLE_ID = "tblClPSzECL3rpbd0"
 SCRAPERAPI_KEY    = os.getenv("SCRAPERAPI_KEY", "")
 
+# Global concurrency limit for ScraperAPI (free tier = 5 concurrent max).
+# All 8 scrapers share this pool so we never exceed the limit.
+_SA_SEM = asyncio.Semaphore(4)
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -121,10 +125,18 @@ def make_row(artist, title, year, medium, dims, price, seller, src_url, src_name
     }
 
 def _purl(url: str) -> str:
-    """Route through ScraperAPI when a key is configured (bypasses bot detection)."""
+    """Wrap URL through ScraperAPI when a key is configured."""
     if not SCRAPERAPI_KEY:
         return url
     return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={urllib.parse.quote(url)}"
+
+async def _pget(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
+    """HTTP GET through ScraperAPI with global concurrency cap (max 4 simultaneous)."""
+    target = _purl(url)
+    if SCRAPERAPI_KEY:
+        async with _SA_SEM:
+            return await client.get(target, **kwargs)
+    return await client.get(target, **kwargs)
 
 # ── Airtable ──────────────────────────────────────────────────────────────────
 async def get_target_artists() -> List[str]:
@@ -158,7 +170,6 @@ async def get_target_artists() -> List[str]:
 
 # ── Artsy — web scraper via __NEXT_DATA__ ─────────────────────────────────────
 def _artsy_find_artworks(obj, depth=0) -> List[dict]:
-    """Recursively find Artwork relay nodes in Artsy's __NEXT_DATA__."""
     if depth > 25 or not obj:
         return []
     results = []
@@ -205,14 +216,13 @@ async def _artsy_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: st
     async with sem:
         try:
             url  = f"https://www.artsy.net/artist/{slug(name)}/works-for-sale"
-            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            resp = await _pget(client, url, headers=HEADERS, follow_redirects=True)
+            print(f"Artsy [{name}]: HTTP {resp.status_code} | {len(resp.text)} chars")
             if resp.status_code != 200:
-                print(f"Artsy [{name}]: HTTP {resp.status_code}")
                 return []
             soup   = BeautifulSoup(resp.text, "html.parser")
             nd_tag = soup.find("script", {"id": "__NEXT_DATA__"})
             if not nd_tag or not nd_tag.string:
-                print(f"Artsy [{name}]: no __NEXT_DATA__ found")
                 return []
             nd_data  = json.loads(nd_tag.string)
             aw_nodes = _artsy_find_artworks(nd_data)
@@ -250,8 +260,8 @@ async def _artsy_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: st
             return []
 
 async def scrape_artsy(artists: List[str]) -> List[dict]:
-    sem = asyncio.Semaphore(5)
-    async with httpx.AsyncClient(timeout=30) as client:
+    sem = asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=45) as client:
         batches = await asyncio.gather(*[_artsy_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
@@ -260,7 +270,8 @@ async def _artnet_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: s
     async with sem:
         try:
             url  = f"https://www.artnet.com/artists/{slug(name)}/works-for-sale/"
-            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            resp = await _pget(client, url, headers=HEADERS, follow_redirects=True)
+            print(f"Artnet [{name}]: HTTP {resp.status_code} | {len(resp.text)} chars")
             soup = BeautifulSoup(resp.text, "html.parser")
             results = []
             for card in soup.select("[class*='artwork-card'], [class*='GridItem'], [class*='ArtworkCard']")[:15]:
@@ -282,8 +293,8 @@ async def _artnet_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: s
             return []
 
 async def scrape_artnet(artists: List[str]) -> List[dict]:
-    sem = asyncio.Semaphore(5)
-    async with httpx.AsyncClient(timeout=30) as client:
+    sem = asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=45) as client:
         batches = await asyncio.gather(*[_artnet_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
@@ -311,7 +322,8 @@ async def _sothebys_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name:
     async with sem:
         try:
             url  = f"https://www.sothebys.com/en/buy/auction/search?query={urllib.parse.quote(name)}&locale=en"
-            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            resp = await _pget(client, url, headers=HEADERS, follow_redirects=True)
+            print(f"Sotheby's [{name}]: HTTP {resp.status_code} | {len(resp.text)} chars")
             soup = BeautifulSoup(resp.text, "html.parser")
             results = []
 
@@ -356,21 +368,21 @@ async def _sothebys_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name:
             return []
 
 async def scrape_sothebys(artists: List[str]) -> List[dict]:
-    sem = asyncio.Semaphore(4)
-    async with httpx.AsyncClient(timeout=30) as client:
+    sem = asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=45) as client:
         batches = await asyncio.gather(*[_sothebys_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
-# ── Christie's — HTML scrape ──────────────────────────────────────────────────
+# ── Christie's ────────────────────────────────────────────────────────────────
 async def _christies_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: str) -> List[dict]:
     async with sem:
         try:
             url  = f"https://www.christies.com/search/?q={urllib.parse.quote(name)}&section=lot&tab=lot"
-            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            resp = await _pget(client, url, headers=HEADERS, follow_redirects=True)
+            print(f"Christie's [{name}]: HTTP {resp.status_code} | {len(resp.text)} chars")
             soup = BeautifulSoup(resp.text, "html.parser")
             results = []
 
-            # __NEXT_DATA__ attempt
             nd_tag = soup.find("script", {"id": "__NEXT_DATA__"})
             if nd_tag and nd_tag.string:
                 try:
@@ -402,7 +414,6 @@ async def _christies_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name
                 except Exception as e:
                     print(f"Christie's [{name}] __NEXT_DATA__: {e}")
 
-            # HTML card fallback
             if not results:
                 for card in soup.select("[class*='chr-list-item'], [class*='listItem'], [class*='lot-item'], article[data-id]")[:10]:
                     title    = (card.select_one("[class*='heading'], [class*='title'], [class*='object-name'], h3, h2") or {}).get_text(strip=True) or "Untitled"
@@ -422,17 +433,18 @@ async def _christies_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name
             return []
 
 async def scrape_christies(artists: List[str]) -> List[dict]:
-    sem = asyncio.Semaphore(5)
-    async with httpx.AsyncClient(timeout=30) as client:
+    sem = asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=45) as client:
         batches = await asyncio.gather(*[_christies_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
-# ── Phillips — HTML scrape ────────────────────────────────────────────────────
+# ── Phillips ──────────────────────────────────────────────────────────────────
 async def _phillips_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: str) -> List[dict]:
     async with sem:
         try:
             url  = f"https://www.phillips.com/search/lots?q={urllib.parse.quote(name)}"
-            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            resp = await _pget(client, url, headers=HEADERS, follow_redirects=True)
+            print(f"Phillips [{name}]: HTTP {resp.status_code} | {len(resp.text)} chars")
             soup = BeautifulSoup(resp.text, "html.parser")
             results = []
 
@@ -486,8 +498,8 @@ async def _phillips_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name:
             return []
 
 async def scrape_phillips(artists: List[str]) -> List[dict]:
-    sem = asyncio.Semaphore(5)
-    async with httpx.AsyncClient(timeout=30) as client:
+    sem = asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=45) as client:
         batches = await asyncio.gather(*[_phillips_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
@@ -496,7 +508,8 @@ async def _seesaw_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: s
     async with sem:
         try:
             url  = f"https://www.seesaw.website/works?q={urllib.parse.quote(name)}&for_sale=true"
-            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            resp = await _pget(client, url, headers=HEADERS, follow_redirects=True)
+            print(f"Seesaw [{name}]: HTTP {resp.status_code} | {len(resp.text)} chars")
             soup = BeautifulSoup(resp.text, "html.parser")
             results = []
             for card in soup.select("[class*='WorkCard'], article, [class*='work-card']")[:15]:
@@ -518,14 +531,13 @@ async def _seesaw_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: s
             return []
 
 async def scrape_seesaw(artists: List[str]) -> List[dict]:
-    sem = asyncio.Semaphore(5)
-    async with httpx.AsyncClient(timeout=30) as client:
+    sem = asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=45) as client:
         batches = await asyncio.gather(*[_seesaw_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
-# ── Invaluable — auction aggregator (thousands of houses) ─────────────────────
+# ── Invaluable — auction aggregator ───────────────────────────────────────────
 def _invaluable_find_items(obj, depth=0) -> List[dict]:
-    """Recursively find lot/item arrays in Invaluable's page data."""
     if depth > 15 or not obj:
         return []
     if isinstance(obj, dict):
@@ -548,7 +560,7 @@ async def _invaluable_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, nam
     async with sem:
         try:
             url  = f"https://www.invaluable.com/search/items/?keyword={urllib.parse.quote(name)}&supercategoryName=Fine+Art&pageSize=20"
-            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            resp = await _pget(client, url, headers=HEADERS, follow_redirects=True)
             print(f"Invaluable [{name}]: HTTP {resp.status_code} | {len(resp.text)} chars")
             soup    = BeautifulSoup(resp.text, "html.parser")
             results = []
@@ -572,7 +584,6 @@ async def _invaluable_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, nam
                 except Exception as e:
                     print(f"Invaluable [{name}] __NEXT_DATA__: {e}")
 
-            # HTML card fallback
             if not results:
                 for card in soup.select("[class*='item-tile'], [class*='ItemTile'], [class*='item-card'], [class*='lot'], article")[:15]:
                     title = (card.select_one("h2, h3, [class*='title'], [class*='Title']") or {}).get_text(strip=True) or "Untitled"
@@ -592,8 +603,8 @@ async def _invaluable_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, nam
             return []
 
 async def scrape_invaluable(artists: List[str]) -> List[dict]:
-    sem = asyncio.Semaphore(4)
-    async with httpx.AsyncClient(timeout=30) as client:
+    sem = asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=45) as client:
         batches = await asyncio.gather(*[_invaluable_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
@@ -621,7 +632,7 @@ async def _liveauc_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: 
     async with sem:
         try:
             url  = f"https://www.liveauctioneers.com/search/?keyword={urllib.parse.quote(name)}&status=upcoming&type=lot"
-            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            resp = await _pget(client, url, headers=HEADERS, follow_redirects=True)
             print(f"LiveAuctioneers [{name}]: HTTP {resp.status_code} | {len(resp.text)} chars")
             soup    = BeautifulSoup(resp.text, "html.parser")
             results = []
@@ -664,8 +675,8 @@ async def _liveauc_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: 
             return []
 
 async def scrape_liveauctioneers(artists: List[str]) -> List[dict]:
-    sem = asyncio.Semaphore(4)
-    async with httpx.AsyncClient(timeout=30) as client:
+    sem = asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=45) as client:
         batches = await asyncio.gather(*[_liveauc_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
@@ -691,6 +702,7 @@ async def run_scrape():
             proxy_note = " via ScraperAPI" if SCRAPERAPI_KEY else " (add SCRAPERAPI_KEY for full results)"
             _set_status(db, "running", f"Scraping {len(artists)} artists across 8 sources{proxy_note}…")
 
+            # All 8 scrapers run concurrently but share _SA_SEM which caps ScraperAPI at 4 concurrent
             artsy_r, artnet_r, sothebys_r, christies_r, phillips_r, seesaw_r, inval_r, liveauc_r = await asyncio.gather(
                 scrape_artsy(artists),
                 scrape_artnet(artists),
