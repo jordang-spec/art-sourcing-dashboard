@@ -523,6 +523,152 @@ async def scrape_seesaw(artists: List[str]) -> List[dict]:
         batches = await asyncio.gather(*[_seesaw_one(client, sem, n) for n in artists])
     return [item for batch in batches for item in batch]
 
+# ── Invaluable — auction aggregator (thousands of houses) ─────────────────────
+def _invaluable_find_items(obj, depth=0) -> List[dict]:
+    """Recursively find lot/item arrays in Invaluable's page data."""
+    if depth > 15 or not obj:
+        return []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in ("items", "lots", "results", "hits", "data") and isinstance(v, list) and v:
+                first = v[0] if isinstance(v[0], dict) else {}
+                if any(x in first for x in ("title", "lotTitle", "description", "estimate", "startingBid", "priceResult")):
+                    return v
+            sub = _invaluable_find_items(v, depth + 1)
+            if sub:
+                return sub
+    elif isinstance(obj, list):
+        for item in obj:
+            sub = _invaluable_find_items(item, depth + 1)
+            if sub:
+                return sub
+    return []
+
+async def _invaluable_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: str) -> List[dict]:
+    async with sem:
+        try:
+            url  = f"https://www.invaluable.com/search/items/?keyword={urllib.parse.quote(name)}&supercategoryName=Fine+Art&pageSize=20"
+            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            print(f"Invaluable [{name}]: HTTP {resp.status_code} | {len(resp.text)} chars")
+            soup    = BeautifulSoup(resp.text, "html.parser")
+            results = []
+
+            nd_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+            if nd_tag and nd_tag.string:
+                try:
+                    items = _invaluable_find_items(json.loads(nd_tag.string))
+                    for item in items[:15]:
+                        title = item.get("title") or item.get("lotTitle") or item.get("description") or "Untitled"
+                        price = item.get("priceResult") or item.get("estimate") or item.get("startingBid") or ""
+                        img_r = item.get("image") or item.get("imageUrl") or item.get("thumbnail") or {}
+                        img_u = (img_r.get("url") or img_r.get("src") or "") if isinstance(img_r, dict) else (img_r if isinstance(img_r, str) else "")
+                        path  = item.get("url") or item.get("ref") or ""
+                        url_l = path if path.startswith("http") else f"https://www.invaluable.com{path}"
+                        house = item.get("auctioneer") or item.get("house") or item.get("sellerName") or "Invaluable"
+                        if isinstance(house, dict):
+                            house = house.get("name") or "Invaluable"
+                        if title and title != "Untitled":
+                            results.append(make_row(name, title, "", "", "", str(price), str(house), url_l, "Invaluable", img_u, True))
+                except Exception as e:
+                    print(f"Invaluable [{name}] __NEXT_DATA__: {e}")
+
+            # HTML card fallback
+            if not results:
+                for card in soup.select("[class*='item-tile'], [class*='ItemTile'], [class*='item-card'], [class*='lot'], article")[:15]:
+                    title = (card.select_one("h2, h3, [class*='title'], [class*='Title']") or {}).get_text(strip=True) or "Untitled"
+                    price = (card.select_one("[class*='price'], [class*='estimate'], [class*='bid']") or {}).get_text(strip=True)
+                    img   = card.select_one("img")
+                    img_u = (img.get("src") or img.get("data-src") or "") if img else ""
+                    a     = card.select_one("a")
+                    href  = (a.get("href") or "") if a else ""
+                    url_l = href if href.startswith("http") else f"https://www.invaluable.com{href}"
+                    if title and title != "Untitled":
+                        results.append(make_row(name, title, "", "", "", price, "Invaluable", url_l, "Invaluable", img_u, True))
+
+            print(f"Invaluable [{name}]: {len(results)} works")
+            return results
+        except Exception as e:
+            print(f"Invaluable [{name}]: {e}")
+            return []
+
+async def scrape_invaluable(artists: List[str]) -> List[dict]:
+    sem = asyncio.Semaphore(4)
+    async with httpx.AsyncClient(timeout=30) as client:
+        batches = await asyncio.gather(*[_invaluable_one(client, sem, n) for n in artists])
+    return [item for batch in batches for item in batch]
+
+# ── LiveAuctioneers — auction aggregator ──────────────────────────────────────
+def _liveauc_find_items(obj, depth=0) -> List[dict]:
+    if depth > 15 or not obj:
+        return []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in ("items", "lots", "results", "hits", "data", "nodes") and isinstance(v, list) and v:
+                first = v[0] if isinstance(v[0], dict) else {}
+                if any(x in first for x in ("title", "lotNumber", "description", "estimate", "openingBid")):
+                    return v
+            sub = _liveauc_find_items(v, depth + 1)
+            if sub:
+                return sub
+    elif isinstance(obj, list):
+        for item in obj:
+            sub = _liveauc_find_items(item, depth + 1)
+            if sub:
+                return sub
+    return []
+
+async def _liveauc_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: str) -> List[dict]:
+    async with sem:
+        try:
+            url  = f"https://www.liveauctioneers.com/search/?keyword={urllib.parse.quote(name)}&status=upcoming&type=lot"
+            resp = await client.get(_purl(url), headers=HEADERS, follow_redirects=True)
+            print(f"LiveAuctioneers [{name}]: HTTP {resp.status_code} | {len(resp.text)} chars")
+            soup    = BeautifulSoup(resp.text, "html.parser")
+            results = []
+
+            nd_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+            if nd_tag and nd_tag.string:
+                try:
+                    items = _liveauc_find_items(json.loads(nd_tag.string))
+                    for item in items[:15]:
+                        title = item.get("title") or item.get("lotTitle") or item.get("description") or "Untitled"
+                        price = item.get("estimate") or item.get("estimateDisplay") or item.get("openingBid") or ""
+                        img_r = item.get("image") or item.get("imageUrl") or item.get("thumbnail") or {}
+                        img_u = (img_r.get("url") or img_r.get("src") or "") if isinstance(img_r, dict) else (img_r if isinstance(img_r, str) else "")
+                        path  = item.get("url") or item.get("ref") or ""
+                        url_l = path if path.startswith("http") else f"https://www.liveauctioneers.com{path}"
+                        house = item.get("auctioneer") or item.get("house") or item.get("sellerName") or "LiveAuctioneers"
+                        if isinstance(house, dict):
+                            house = house.get("name") or "LiveAuctioneers"
+                        if title and title != "Untitled":
+                            results.append(make_row(name, title, "", "", "", str(price), str(house), url_l, "LiveAuctioneers", img_u, True))
+                except Exception as e:
+                    print(f"LiveAuctioneers [{name}] __NEXT_DATA__: {e}")
+
+            if not results:
+                for card in soup.select("[class*='item-tile'], [class*='lot-tile'], [class*='ItemCard'], [class*='LotCard'], article")[:15]:
+                    title = (card.select_one("h2, h3, [class*='title'], [class*='Title']") or {}).get_text(strip=True) or "Untitled"
+                    price = (card.select_one("[class*='estimate'], [class*='price'], [class*='bid']") or {}).get_text(strip=True)
+                    img   = card.select_one("img")
+                    img_u = (img.get("src") or img.get("data-src") or "") if img else ""
+                    a     = card.select_one("a")
+                    href  = (a.get("href") or "") if a else ""
+                    url_l = href if href.startswith("http") else f"https://www.liveauctioneers.com{href}"
+                    if title and title != "Untitled":
+                        results.append(make_row(name, title, "", "", "", price, "LiveAuctioneers", url_l, "LiveAuctioneers", img_u, True))
+
+            print(f"LiveAuctioneers [{name}]: {len(results)} works")
+            return results
+        except Exception as e:
+            print(f"LiveAuctioneers [{name}]: {e}")
+            return []
+
+async def scrape_liveauctioneers(artists: List[str]) -> List[dict]:
+    sem = asyncio.Semaphore(4)
+    async with httpx.AsyncClient(timeout=30) as client:
+        batches = await asyncio.gather(*[_liveauc_one(client, sem, n) for n in artists])
+    return [item for batch in batches for item in batch]
+
 # ── Main scrape job ───────────────────────────────────────────────────────────
 _lock = asyncio.Lock()
 
@@ -542,18 +688,20 @@ async def run_scrape():
         try:
             _set_status(db, "running", "Fetching artists from Airtable…")
             artists = await get_target_artists()
-            proxy_note = " via ScraperAPI" if SCRAPERAPI_KEY else " (no SCRAPERAPI_KEY — results may be limited)"
-            _set_status(db, "running", f"Scraping {len(artists)} artists across 6 sources{proxy_note}…")
+            proxy_note = " via ScraperAPI" if SCRAPERAPI_KEY else " (add SCRAPERAPI_KEY for full results)"
+            _set_status(db, "running", f"Scraping {len(artists)} artists across 8 sources{proxy_note}…")
 
-            artsy_r, artnet_r, sothebys_r, christies_r, phillips_r, seesaw_r = await asyncio.gather(
+            artsy_r, artnet_r, sothebys_r, christies_r, phillips_r, seesaw_r, inval_r, liveauc_r = await asyncio.gather(
                 scrape_artsy(artists),
                 scrape_artnet(artists),
                 scrape_sothebys(artists),
                 scrape_christies(artists),
                 scrape_phillips(artists),
                 scrape_seesaw(artists),
+                scrape_invaluable(artists),
+                scrape_liveauctioneers(artists),
             )
-            all_results = artsy_r + artnet_r + sothebys_r + christies_r + phillips_r + seesaw_r
+            all_results = artsy_r + artnet_r + sothebys_r + christies_r + phillips_r + seesaw_r + inval_r + liveauc_r
 
             db.query(Artwork).delete()
             seen, saved = set(), 0
